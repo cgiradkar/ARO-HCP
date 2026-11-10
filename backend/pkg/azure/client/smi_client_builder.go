@@ -21,6 +21,8 @@ import (
 	"errors"
 	"fmt"
 
+	"k8s.io/utils/ptr"
+
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	azcorearm "github.com/Azure/azure-sdk-for-go/sdk/azcore/arm"
 	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
@@ -83,6 +85,10 @@ type ServiceManagedIdentityClientBuilder interface {
 type serviceManagedIdentityClientBuilder struct {
 	fpaMIdataplaneClientBuilder FPAMIDataplaneClientBuilder
 	azCoreARMClientOptions      *azcorearm.ClientOptions
+	// userAssignedIdentitiesRateLimiters hands out one rate limiter per Service Managed Identity
+	// principal so that all UserAssignedIdentitiesClients built for the same principal share that
+	// principal's ARM read budget. See rate_limited_user_assigned_identities_client.go.
+	userAssignedIdentitiesRateLimiters *userAssignedIdentitiesRateLimiters
 }
 
 var _ ServiceManagedIdentityClientBuilder = (*serviceManagedIdentityClientBuilder)(nil)
@@ -92,11 +98,13 @@ func (b *serviceManagedIdentityClientBuilder) BuilderType() ServiceManagedIdenti
 }
 
 // credentialsForServiceManagedIdentity acquires an azcore.TokenCredential for the cluster's
-// Service Managed Identity by going through the Managed Identities Data Plane.
-func (b *serviceManagedIdentityClientBuilder) credentialsForServiceManagedIdentity(ctx context.Context, clusterIdentityURL string, smiResourceID *azcorearm.ResourceID) (azcore.TokenCredential, error) {
+// Service Managed Identity by going through the Managed Identities Data Plane. It also returns
+// the credential's client ID: the Azure principal the caller's clients will act as, and the key
+// that identifies the ARM read budget those calls are subject to.
+func (b *serviceManagedIdentityClientBuilder) credentialsForServiceManagedIdentity(ctx context.Context, clusterIdentityURL string, smiResourceID *azcorearm.ResourceID) (azcore.TokenCredential, string, error) {
 	miDataplaneClient, err := b.fpaMIdataplaneClientBuilder.ManagedIdentitiesDataplane(clusterIdentityURL)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	dataplaneRequest := dataplane.UserAssignedIdentitiesRequest{
@@ -104,31 +112,45 @@ func (b *serviceManagedIdentityClientBuilder) credentialsForServiceManagedIdenti
 	}
 	resp, err := miDataplaneClient.GetUserAssignedIdentitiesCredentials(ctx, dataplaneRequest)
 	if err != nil {
-		return nil, utils.TrackError(fmt.Errorf("failed to get user assigned identities credentials: %w", err))
+		return nil, "", utils.TrackError(fmt.Errorf("failed to get user assigned identities credentials: %w", err))
 	}
 	if len(resp.ExplicitIdentities) == 0 {
-		return nil, utils.TrackError(fmt.Errorf("managed identities data plane returned no credentials for the cluster's service managed identity '%s'", smiResourceID.String()))
+		return nil, "", utils.TrackError(fmt.Errorf("managed identities data plane returned no credentials for the cluster's service managed identity '%s'", smiResourceID.String()))
 	}
 
 	identity := resp.ExplicitIdentities[0]
 
 	if miDataplaneIdentityCredentialFieldsMissing(identity) {
-		return nil, utils.TrackError(fmt.Errorf("%w: %q", ErrSMIClientBuilderIdentityNotFound, smiResourceID.String()))
+		return nil, "", utils.TrackError(fmt.Errorf("%w: %q", ErrSMIClientBuilderIdentityNotFound, smiResourceID.String()))
 	}
 
-	return dataplane.GetCredential(b.azCoreARMClientOptions.ClientOptions, identity)
+	creds, err := dataplane.GetCredential(b.azCoreARMClientOptions.ClientOptions, identity)
+	if err != nil {
+		return nil, "", err
+	}
+	return creds, ptr.Deref(identity.ClientID, ""), nil
 }
 
 func (b *serviceManagedIdentityClientBuilder) UserAssignedIdentitiesClient(ctx context.Context, clusterIdentityURL string, smiResourceID *azcorearm.ResourceID, subscriptionID string) (UserAssignedIdentitiesClient, error) {
-	creds, err := b.credentialsForServiceManagedIdentity(ctx, clusterIdentityURL, smiResourceID)
+	creds, principalClientID, err := b.credentialsForServiceManagedIdentity(ctx, clusterIdentityURL, smiResourceID)
 	if err != nil {
 		return nil, utils.TrackError(fmt.Errorf("failed to get credentials for service managed identity: %w", err))
 	}
-	return armmsi.NewUserAssignedIdentitiesClient(subscriptionID, creds, b.azCoreARMClientOptions)
+	client, err := armmsi.NewUserAssignedIdentitiesClient(subscriptionID, creds, b.azCoreARMClientOptions)
+	if err != nil {
+		return nil, err
+	}
+	// All clients acting as the same Azure principal share that principal's ARM read budget,
+	// so they also share one rate limiter, keyed by the credential's client ID. See
+	// rate_limited_user_assigned_identities_client.go.
+	return &rateLimitedUserAssignedIdentitiesClient{
+		inner:       client,
+		rateLimiter: b.userAssignedIdentitiesRateLimiters.getOrCreate(principalClientID),
+	}, nil
 }
 
 func (b *serviceManagedIdentityClientBuilder) SubnetsClient(ctx context.Context, clusterIdentityURL string, smiResourceID *azcorearm.ResourceID, subscriptionID string) (SubnetsClient, error) {
-	creds, err := b.credentialsForServiceManagedIdentity(ctx, clusterIdentityURL, smiResourceID)
+	creds, _, err := b.credentialsForServiceManagedIdentity(ctx, clusterIdentityURL, smiResourceID)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +158,7 @@ func (b *serviceManagedIdentityClientBuilder) SubnetsClient(ctx context.Context,
 }
 
 func (b *serviceManagedIdentityClientBuilder) NetworkSecurityGroupsClient(ctx context.Context, clusterIdentityURL string, smiResourceID *azcorearm.ResourceID, subscriptionID string) (NetworkSecurityGroupsClient, error) {
-	creds, err := b.credentialsForServiceManagedIdentity(ctx, clusterIdentityURL, smiResourceID)
+	creds, _, err := b.credentialsForServiceManagedIdentity(ctx, clusterIdentityURL, smiResourceID)
 	if err != nil {
 		return nil, utils.TrackError(fmt.Errorf("failed to get credentials for service managed identity: %w", err))
 	}
@@ -147,7 +169,7 @@ func (b *serviceManagedIdentityClientBuilder) NetworkSecurityGroupsClient(ctx co
 }
 
 func (b *serviceManagedIdentityClientBuilder) FederatedIdentityCredentialsClient(ctx context.Context, clusterIdentityURL string, smiResourceID *azcorearm.ResourceID, subscriptionID string) (FederatedIdentityCredentialsClient, error) {
-	creds, err := b.credentialsForServiceManagedIdentity(ctx, clusterIdentityURL, smiResourceID)
+	creds, _, err := b.credentialsForServiceManagedIdentity(ctx, clusterIdentityURL, smiResourceID)
 	if err != nil {
 		return nil, utils.TrackError(fmt.Errorf("failed to get credentials for service managed identity: %w", err))
 	}
@@ -156,7 +178,8 @@ func (b *serviceManagedIdentityClientBuilder) FederatedIdentityCredentialsClient
 
 func NewServiceManagedIdentityClientBuilder(fpaMIdataplaneClientBuilder FPAMIDataplaneClientBuilder, options *azcorearm.ClientOptions) ServiceManagedIdentityClientBuilder {
 	return &serviceManagedIdentityClientBuilder{
-		fpaMIdataplaneClientBuilder: fpaMIdataplaneClientBuilder,
-		azCoreARMClientOptions:      options,
+		fpaMIdataplaneClientBuilder:        fpaMIdataplaneClientBuilder,
+		azCoreARMClientOptions:             options,
+		userAssignedIdentitiesRateLimiters: newUserAssignedIdentitiesRateLimiters(),
 	}
 }

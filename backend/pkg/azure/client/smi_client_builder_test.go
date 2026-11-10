@@ -122,8 +122,9 @@ func TestServiceManagedIdentityClientBuilder_NotFoundPropagation(t *testing.T) {
 		for _, s := range scenarios {
 			t.Run(m.name+": "+s.name, func(t *testing.T) {
 				builder := &serviceManagedIdentityClientBuilder{
-					fpaMIdataplaneClientBuilder: &fakeFPAMIDataplaneClientBuilder{client: s.client},
-					azCoreARMClientOptions:      &azcorearm.ClientOptions{},
+					fpaMIdataplaneClientBuilder:        &fakeFPAMIDataplaneClientBuilder{client: s.client},
+					azCoreARMClientOptions:             &azcorearm.ClientOptions{},
+					userAssignedIdentitiesRateLimiters: newUserAssignedIdentitiesRateLimiters(),
 				}
 
 				err := m.call(builder, context.Background(), "https://example.com", smiResourceID, smiResourceID.SubscriptionID)
@@ -149,7 +150,8 @@ func TestServiceManagedIdentityClientBuilder_NotFoundPropagation(t *testing.T) {
 					creds: &dataplane.ManagedIdentityCredentials{ExplicitIdentities: []dataplane.UserAssignedIdentityCredentials{completeCredential}},
 				},
 			},
-			azCoreARMClientOptions: &azcorearm.ClientOptions{},
+			azCoreARMClientOptions:             &azcorearm.ClientOptions{},
+			userAssignedIdentitiesRateLimiters: newUserAssignedIdentitiesRateLimiters(),
 		}
 
 		_, err := builder.UserAssignedIdentitiesClient(context.Background(), "https://example.com", smiResourceID, smiResourceID.SubscriptionID)
